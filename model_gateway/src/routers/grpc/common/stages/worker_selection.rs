@@ -1936,7 +1936,7 @@ impl WorkerSelectionStage {
         // Filter all three pools to the target runtime
         let available_encode = on_runtime(all_encode, target_runtime);
         let mut available_prefill = on_runtime(all_prefill, target_runtime);
-        let available_decode = on_runtime(all_decode, target_runtime);
+        let mut available_decode = on_runtime(all_decode, target_runtime);
 
         if (needs_encode && available_encode.is_empty())
             || available_prefill.is_empty()
@@ -1990,6 +1990,10 @@ impl WorkerSelectionStage {
         {
             return Err(EpdSelectionFailure::PrefillAtCapacity);
         }
+        // The decode dispatch waits at the same admission gate as a PD one:
+        // a full decode worker leaves the pick while a sibling has a room
+        // (see `placement::select_pair`).
+        placement::retain_decodes_with_a_room(&mut available_decode);
         info.role = WorkerRole::Decode;
         let decode_idx = self
             .policy_registry

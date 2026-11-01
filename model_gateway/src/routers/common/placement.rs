@@ -32,7 +32,7 @@ use crate::{
         SelectWorkerInfo, WorkerRole,
     },
     routers::{
-        common::{header_utils, overload, retry::mark_non_retryable},
+        common::{header_utils, overload, pd_admission, retry::mark_non_retryable},
         error,
     },
     worker::{
@@ -1171,7 +1171,7 @@ pub(crate) fn select_pair(
     }
     // The pick's open partners: non-empty by construction, short of an
     // availability flip between the two reads.
-    let decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
+    let mut decode: Vec<Arc<dyn Worker>> = pairs.partners[open[prefill_idx]]
         .iter()
         .filter(|d| partner_open(d, pair_runtime))
         .cloned()
@@ -1183,6 +1183,7 @@ pub(crate) fn select_pair(
         );
         return Err(fail(WorkerRole::Decode, PlacementFailure::Unavailable));
     }
+    retain_decodes_with_a_room(&mut decode);
     // A decode pool all over the thresholds pairs by load, as the default
     // paired it: the least-loaded of the pick's partners, counted as a veto
     // fallback and not as a selection of the decode policy. Any other keeps
@@ -1239,9 +1240,34 @@ pub(crate) fn select_pair(
     })
 }
 
+/// Narrow a decode pick's candidates to the workers whose admission gate
+/// would seat one more room now ([`pd_admission::has_free_room`]), when some
+/// have one and some do not; with every candidate full, or none reporting a
+/// window, the list is left as it is and the policy chooses as before, the
+/// dispatch waiting on its pick.
+///
+/// The pick reads the rooms the gate claims against because the policies
+/// cannot: a load report never carries the places parked at the gateway, and
+/// the router's in-flight count rises only on admission, so a load-scoring
+/// policy kept picking the full side whose queue it was growing while its
+/// siblings had rooms. Two passes of atomic reads, no allocation.
+pub(crate) fn retain_decodes_with_a_room(decode: &mut Vec<Arc<dyn Worker>>) {
+    let with_room = decode
+        .iter()
+        .filter(|d| pd_admission::has_free_room(d.as_ref()))
+        .count();
+    if with_room > 0 && with_room < decode.len() {
+        decode.retain(|d| pd_admission::has_free_room(d.as_ref()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        sync::Mutex,
+        time::Duration,
+    };
 
     use axum::http::StatusCode;
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
@@ -1251,8 +1277,15 @@ mod tests {
     use crate::{
         config::types::{PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
         observability::logging::test_support::test_subscriber,
-        policies::{CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, RoundRobinPolicy},
-        worker::{runtime::StallReason, BasicWorkerBuilder, ModelCard, PdWire, WorkerType},
+        policies::{
+            CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy, LeastLoadPolicy,
+            PowerOfTwoPolicy, RoundRobinPolicy,
+        },
+        worker::{
+            load_state::{one_rank_load, TestFeed},
+            runtime::StallReason,
+            BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
+        },
     };
 
     const MODEL: &str = "m";
@@ -1336,6 +1369,133 @@ mod tests {
             *hits.entry(pair.decode.url().to_string()).or_insert(0) += 1;
         }
         hits
+    }
+
+    /// One prefill and two decode workers, each decode with a running window
+    /// of `window` rooms, so the admission gate's rooms count in the pick.
+    fn gated_pd_registry(window: u16) -> WorkerRegistry {
+        let registry = WorkerRegistry::new();
+        for (url, worker_type) in [
+            ("grpc://p:1", WorkerType::Prefill),
+            ("grpc://d:1", WorkerType::Decode),
+            ("grpc://d:2", WorkerType::Decode),
+        ] {
+            let mut labels = HashMap::new();
+            if matches!(worker_type, WorkerType::Decode) {
+                labels.insert("max_running_requests".to_string(), window.to_string());
+            }
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(MODEL))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::Vllm)
+                        .kv_connector("NixlConnector")
+                        .labels(labels)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("worker registers");
+        }
+        registry
+    }
+
+    /// A decode partner whose window is full, or whose free room a place
+    /// waiting at its gate is in line for, is left out of the pick while its
+    /// sibling has a room; with both full the policy chooses as before.
+    #[test]
+    fn a_full_decode_window_sends_the_pick_to_the_partner_with_a_room() {
+        let registry = gated_pd_registry(2);
+        let policies = cohort_policies();
+        let full = registry.get_by_url("grpc://d:1").expect("registered");
+        assert!(full.try_admit_pd(2, 2), "both rooms claimed");
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        assert_eq!(picks["grpc://d:2"], 10, "{picks:?}");
+
+        // One room freed, but a place already waits for it.
+        full.release_pd(1);
+        let place = full.pd_enqueue(1);
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(
+            picks.get("grpc://d:1").copied().unwrap_or(0),
+            0,
+            "{picks:?}"
+        );
+        full.pd_dequeue(place);
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(picks["grpc://d:1"], 5, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 5, "{picks:?}");
+
+        // Every partner full: the policy's own rotation, and the dispatch
+        // waits on its pick as before.
+        let other = registry.get_by_url("grpc://d:2").expect("registered");
+        assert!(full.try_admit_pd(1, 2) && other.try_admit_pd(2, 2));
+        let picks = hits(&registry, &policies, 10);
+        assert_eq!(picks["grpc://d:1"], 5, "{picks:?}");
+        assert_eq!(picks["grpc://d:2"], 5, "{picks:?}");
+    }
+
+    /// The load-scoring decode policies price a side by its report and
+    /// their own dispatch credit, neither of which holds a request parked at
+    /// the gate, and a fuller batch reports the higher aggregate rate, so a
+    /// full decode side read as the cheaper pick while its queue grew. With
+    /// the gate's rooms in the selection the full side is not offered.
+    #[test]
+    fn the_load_scoring_policies_are_not_offered_a_full_decode_window() {
+        let scorers: [Arc<dyn LoadBalancingPolicy>; 2] = [
+            Arc::new(LeastLoadPolicy::new()),
+            Arc::new(PowerOfTwoPolicy::new()),
+        ];
+        for decode_policy in scorers {
+            let name = decode_policy.name();
+            let registry = gated_pd_registry(8);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+            let feed = TestFeed::attached_to(decode_policy.as_ref());
+            policies.set_decode_policy(decode_policy);
+            // d:1 runs its whole window of eight at 160 tokens/s and holds
+            // every room; d:2 runs one request at 20 tokens/s.
+            let mut full_report = one_rank_load(0, 0.0, 160.0);
+            full_report.loads[0].num_running_reqs = 8;
+            feed.publish(&HashMap::from([
+                ("grpc://d:1".to_string(), full_report),
+                ("grpc://d:2".to_string(), one_rank_load(0, 0.0, 20.0)),
+            ]));
+            let full = registry.get_by_url("grpc://d:1").expect("registered");
+            assert!(full.try_admit_pd(8, 8));
+            let tokens: Vec<u32> = (0..512).collect();
+            let pairs = pairs_of(&registry, &policies);
+            for _ in 0..20 {
+                let pair = select_pair(
+                    &registry,
+                    &policies,
+                    MODEL,
+                    &pairs,
+                    None,
+                    true,
+                    None,
+                    PlacementInputs {
+                        tokens: Some(&tokens),
+                        ..Default::default()
+                    },
+                )
+                .expect("a pair is open");
+                assert_eq!(
+                    pair.decode.url(),
+                    "grpc://d:2",
+                    "{name} picked the full side"
+                );
+            }
+        }
     }
 
     #[test]
