@@ -39,7 +39,7 @@ impl PipelineStage for CompletionPreparationStage {
         let encodings = try_join_all(
             prompts
                 .iter()
-                .map(|prompt| utils::encode_blocking(tokenizer.clone(), prompt.clone(), false)),
+                .map(|prompt| utils::encode_blocking(tokenizer.clone(), prompt, false)),
         )
         .await
         .map_err(|e| {
