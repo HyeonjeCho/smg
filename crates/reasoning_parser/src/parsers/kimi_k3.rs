@@ -156,8 +156,15 @@ impl KimiK3Parser {
     ///   parsing, since a forced tool call can jump straight from the prefilled
     ///   `<|open|>think<|sep|>` into `<|open|>tools<|sep|>`. `message` is
     ///   excluded — it opens *before* the think channel.
-    /// - sibling `response`/`message` *closer*: spans `(from, from)`, all answer
-    ///   and no reasoning, and only when `!think_observed`.
+    /// - sibling `response`/`message` *closer*: spans `(emitted_end, emitted_end)`,
+    ///   all answer and no reasoning past what was already returned as such,
+    ///   and only when `!think_observed`.
+    ///
+    /// `emitted_end` is where the reasoning the caller has already returned
+    /// ends: `from` for a whole text, the end of the streamed deltas while
+    /// streaming. A delta cannot be recalled, so the answer a sibling closer
+    /// proves begins where the deltas end, and no byte reaches the client a
+    /// second time as content.
     ///
     /// `think_observed` says whether `text` holds a literal `<|open|>think<|sep|>`,
     /// as opposed to the channel being *assumed* open because the caller
@@ -170,6 +177,7 @@ impl KimiK3Parser {
         &self,
         text: &str,
         from: usize,
+        emitted_end: usize,
         think_observed: bool,
     ) -> Option<(usize, usize)> {
         let close = self
@@ -189,9 +197,9 @@ impl KimiK3Parser {
                     .min()
             })
             .flatten()
-            .map(|start| (start, (from, from)));
-        // Keyed on marker position, not on the returned span, or `(from, from)`
-        // would always win. Ties favour `close` (listed first), though no two
+            .map(|start| (start, (emitted_end, emitted_end)));
+        // Keyed on marker position, not on the returned span, or the closer's
+        // span would always win. Ties favour `close` (listed first), though no two
         // markers share a literal prefix so ties cannot arise.
         [close, sibling_open, sibling_close]
             .into_iter()
@@ -320,7 +328,7 @@ impl ReasoningParser for KimiK3Parser {
         }
 
         let Some((reasoning_end, content_start)) =
-            self.think_channel_end(text, reasoning_start, m_open.is_some())
+            self.think_channel_end(text, reasoning_start, reasoning_start, m_open.is_some())
         else {
             // Opened but never closed — e.g. output truncated mid-thought.
             // Classify the remainder as reasoning rather than lose it, less a
@@ -387,16 +395,24 @@ impl ReasoningParser for KimiK3Parser {
         // indefinitely.
         //
         // A sibling closer can also end it — see `think_channel_end`. Recovery is
-        // partial while streaming, since reasoning deltas for what turns out to be
-        // the answer cannot be recalled and so repeat in `reasoning_text`; what it
-        // buys is a complete `normal_text` and a cleared `in_reasoning`, which
-        // gates the tool parser. Non-streaming is exact.
+        // partial while streaming: the reasoning deltas already returned for what
+        // turns out to be the answer cannot be recalled, so they stay reasoning
+        // and the content begins where they end; every byte reaches the client
+        // once, and `in_reasoning` is cleared, which gates the tool parser. Whole,
+        // the same answer is all content.
         let think_open = self.think_open_re.find(&self.buffer);
         let think_observed = think_open.is_some();
         let r_start = think_open.map(|m| m.end()).unwrap_or(0);
+        // Where the returned reasoning ends, while the buffer still begins with
+        // it (the invariant the deltas below rely on); `r_start` otherwise.
+        let emitted_end = if self.buffer[r_start..].starts_with(self.emitted_reasoning.as_str()) {
+            r_start + self.emitted_reasoning.len()
+        } else {
+            r_start
+        };
 
         if let Some((reasoning_end, content_start)) =
-            self.think_channel_end(&self.buffer, r_start, think_observed)
+            self.think_channel_end(&self.buffer, r_start, emitted_end, think_observed)
         {
             // Transition: reasoning phase ends.
             self.reason_phase_ended = true;
@@ -774,15 +790,16 @@ mod tests {
     }
 
     #[test]
-    fn streaming_answer_closed_as_response_recovers_content() {
+    fn streaming_answer_closed_as_response_ends_reasoning_without_a_replay() {
         // Streaming counterpart of the regression above, with the closer split
         // across chunks so the widened holdback set is exercised too: a leaked
         // `res` would show up in `reasoning`.
         //
-        // Recovery is partial by construction — the answer was already streamed
-        // as reasoning deltas before the closer arrived, so it appears in both
-        // fields. What matters is a complete `normal_text` and a cleared
-        // `in_reasoning`, which gates the tool parser.
+        // The answer was streamed as reasoning deltas before the closer arrived
+        // and cannot be recalled, so it stays reasoning: `normal_text` begins
+        // where the streamed reasoning ends and nothing reaches the client
+        // twice. The closer still clears `in_reasoning`, which gates the tool
+        // parser.
         let mut p = KimiK3Parser::new();
         p.mark_reasoning_started();
         let chunks = [
@@ -801,9 +818,96 @@ mod tests {
             normal.push_str(&result.normal_text);
         }
 
-        assert_eq!(normal, "The answer is 42.");
         assert_eq!(reasoning, "The answer is 42.");
+        assert_eq!(normal, "", "the answer was streamed as reasoning already");
         assert!(!p.is_in_reasoning());
+    }
+
+    #[test]
+    fn a_sibling_closer_after_streamed_reasoning_replays_nothing_as_content() {
+        // The two deltas a client used to receive twice: the answer, streamed
+        // as reasoning, then the sibling closers ending the turn with no think
+        // close. The closers return nothing in either field, and the flush
+        // nothing more.
+        let mut p = KimiK3Parser::new();
+        p.mark_reasoning_started();
+        let answer = p
+            .parse_reasoning_streaming_incremental("The answer is 42.")
+            .unwrap();
+        assert_eq!(
+            answer,
+            ParserResult::reasoning("The answer is 42.".to_owned())
+        );
+        assert!(p.is_in_reasoning());
+        let closers = p
+            .parse_reasoning_streaming_incremental(
+                "<|close|>response<|sep|><|close|>message<|sep|>",
+            )
+            .unwrap();
+        assert_eq!(
+            closers,
+            ParserResult::default(),
+            "{closers:?} reached the client a second time"
+        );
+        assert!(!p.is_in_reasoning());
+        assert!(p.flush().unwrap().is_empty());
+    }
+
+    /// `text` in pieces of `size` bytes, the last one shorter when it must be.
+    fn pieces(text: &str, size: usize) -> Vec<&str> {
+        (0..text.len())
+            .step_by(size)
+            .map(|at| &text[at..text.len().min(at + size)])
+            .collect()
+    }
+
+    #[test]
+    fn a_skipped_think_channel_reaches_the_client_once_at_every_chunking() {
+        // The answer written straight into the prefilled think channel and the
+        // turn closed by a sibling closer, in pieces of every size. What was
+        // streamed as reasoning before the closer arrived stays reasoning, the
+        // rest is content, and the two together are the answer exactly once;
+        // where the split falls depends on the pieces. Whole, the answer is all
+        // content, as the closer proves it was.
+        for closers in [
+            "<|close|>response<|sep|><|close|>message<|sep|>",
+            "<|close|>message<|sep|>",
+        ] {
+            let text = format!("The answer is 42.{closers}");
+            assert_eq!(
+                parsed(&text, true),
+                ParserResult::normal("The answer is 42.".to_owned()),
+                "whole, closed by {closers}"
+            );
+            for size in 1..=text.len() {
+                let got = streamed(&pieces(&text, size), true);
+                assert_eq!(
+                    format!("{}{}", got.reasoning_text, got.normal_text),
+                    "The answer is 42.",
+                    "pieces of {size} bytes, closed by {closers}: {got:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_closed_think_channel_streams_the_thought_and_the_answer_once_at_every_chunking() {
+        // The regular shape in pieces of every size: the thought is the thought
+        // and the answer is the answer, streamed and whole alike. The sibling
+        // closer path changes nothing here.
+        let text = concat!(
+            "Thought<|close|>think<|sep|><|open|>response<|sep|>",
+            "The answer is 42.<|close|>response<|sep|><|close|>message<|sep|>"
+        );
+        let expected = ParserResult::new("The answer is 42.".to_owned(), "Thought".to_owned());
+        assert_eq!(parsed(text, true), expected, "whole");
+        for size in 1..=text.len() {
+            assert_eq!(
+                streamed(&pieces(text, size), true),
+                expected,
+                "pieces of {size} bytes"
+            );
+        }
     }
 
     #[test]

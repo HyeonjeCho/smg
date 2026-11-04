@@ -1733,6 +1733,115 @@ async fn kimi_k3_cut_inside_the_closing_structure_keeps_the_markers_out_of_conte
     }
 }
 
+/// The Kimi K3 reasoning parser on an answer the model wrote straight into the
+/// prefilled think channel and closed with the sibling closers, never with the
+/// think close: streamed, the answer reaches the client once, in the field it
+/// was streamed to; whole, it is content, as the closer proves it was.
+#[tokio::test]
+async fn kimi_k3_answer_closed_as_response_reaches_the_client_once() {
+    // Thinking on: the prompt opened the think channel (the spec says so), the
+    // model answers into it and closes the turn as `response` and `message`,
+    // one marker a token. The client used to receive the answer twice: as
+    // reasoning while it streamed, and again as content when the closers came.
+    let tokens = [
+        "The answer",
+        " is 42.",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+    ];
+    let resolver = || {
+        utils::ParserResolver::with_flags(
+            Arc::new(WorkerRegistry::new()),
+            Some("kimi_k3".to_string()),
+            Some("kimi_k3".to_string()),
+        )
+    };
+    // One chunk per token when streaming; either way the complete frame
+    // carries the output as its ids.
+    let frames = |streaming: bool| -> Vec<proto::GenerateResponse> {
+        let mut last = complete(0, "stop");
+        if let Some(GenerationEvent::Complete(complete)) = &mut last.response {
+            complete.output_ids = tokens.concat().chars().map(u32::from).collect();
+        }
+        let mut frames: Vec<_> = if streaming {
+            tokens.iter().map(|token| chunk(0, token)).collect()
+        } else {
+            Vec::new()
+        };
+        frames.push(last);
+        frames
+    };
+
+    // The chat stream: the answer in `reasoning_content`, nothing in `content`.
+    let mut spec = chat_spec(false);
+    spec.reasoning_in_prefill = true;
+    let (stream, server) = scripted_stream(frames(true), "0").await;
+    let (tx, rx) = sse_channel();
+    let result = streaming_processor(resolver())
+        .process_streaming_chunks(
+            stream,
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            (None, None, false, false, false),
+            spec,
+            &tx,
+            None,
+        )
+        .await;
+    drop(tx);
+    let events = collect_events(rx).await;
+    server.abort();
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        chat_text(&events, 0, "reasoning_content"),
+        "The answer is 42."
+    );
+    assert_eq!(
+        chat_text(&events, 0, "content"),
+        "",
+        "the answer reached the client a second time"
+    );
+
+    // The Messages stream: the answer as thinking deltas and no text; whole,
+    // the answer is the text.
+    let spec = MessagesResponseSpec {
+        thinking_requested: true,
+        thinking_text_returned: true,
+        reasoning_in_prefill: true,
+        tool_choice: None,
+        has_tools: false,
+        history_tool_calls_count: 0,
+        chat_tools: Vec::new().into(),
+        stop_sequences: None,
+        symphony: None,
+        first_tool_call_only: false,
+        parser_names: None,
+    };
+    for (streaming, thinking, text) in [
+        (true, "The answer is 42.", ""),
+        (false, "", "The answer is 42."),
+    ] {
+        let answer = messages_answer(
+            frames(streaming),
+            spec.clone(),
+            resolver(),
+            dispatch(),
+            Arc::new(CharacterTokenizer::default()),
+            streaming,
+        )
+        .await;
+        assert_eq!(
+            thinking_and_text(&answer, streaming),
+            (thinking.to_owned(), text.to_owned()),
+            "streaming {streaming}: {answer:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn chat_stream_error_does_not_flush_a_success_tail() {
     let (result, events) = chat_events(
