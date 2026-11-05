@@ -445,6 +445,21 @@ impl GossipController {
                         )
                         .await;
                     if let Ok(node_update) = relayed {
+                        // A relay answers for the node it reached. An answer
+                        // named for another member (a stale address another
+                        // node holds now) is not the peer's: it must not mark
+                        // the peer reachable or move its entry. The join
+                        // peer's placeholder is the one name the answer may
+                        // supply.
+                        if peer_name != INIT_PEER_NAME && node_update.name != peer_name {
+                            log::warn!(
+                                "The relay through {} answered for {}, not {}: a stale address, next relay",
+                                node.address,
+                                node_update.name,
+                                peer_name
+                            );
+                            continue;
+                        }
                         // The peer's own answer, brought back by the relay:
                         // its status and address go into the table as a
                         // direct answer's do, so a member held `Suspected`
