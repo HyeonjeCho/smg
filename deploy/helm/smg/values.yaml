@@ -441,7 +441,10 @@ grafana:
 #     probes' 200s would dilute the share of failing client responses.
 #   ttftP99Seconds 5 for 10m: time to first token is the wait a user sees; a
 #     p99 above five seconds for ten minutes means queues are building in
-#     front of the engines (set it to the SLO once there is one).
+#     front of the engines (set it to the SLO once there is one). The family
+#     holds the gRPC router's streamed answers alone: the HTTP router records
+#     none, and a collected answer records no first token, so a deployment on
+#     the HTTP router or whose clients do not stream has an empty alert.
 #   noHealthyWorkerFor 1m: nothing can be served; one minute rides out the
 #     overlap of a rolling restart.
 #   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine

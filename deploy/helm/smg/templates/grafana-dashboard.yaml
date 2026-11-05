@@ -228,6 +228,7 @@ data:
               "legendFormat": "p99"
             }
           ],
+          "description": "The gRPC router's streamed answers alone, across models: the HTTP router records none, and a collected answer records no first token. The SmgTtftP99High alert fires on the p99 above prometheusRule.alerts.ttftP99Seconds.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
@@ -251,6 +252,7 @@ data:
               "legendFormat": "{{ "{{" }}model{{ "}}" }}"
             }
           ],
+          "description": "The gRPC router's streamed answers alone: the HTTP router records none, and a collected answer records no first token.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
@@ -282,6 +284,7 @@ data:
               "legendFormat": "p99"
             }
           ],
+          "description": "The gRPC router's streamed answers alone, across models: the HTTP router records none, and a collected answer records no first token and so no time per output token.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
@@ -305,6 +308,7 @@ data:
               "legendFormat": "{{ "{{" }}model{{ "}}" }}"
             }
           ],
+          "description": "The gRPC router's streamed answers alone: the HTTP router records none, and a collected answer records no first token and so no time per output token.",
           "fieldConfig": {
             "defaults": {
               "unit": "s"
