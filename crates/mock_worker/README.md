@@ -22,11 +22,19 @@ Two modes:
 - `POST /v1/chat/completions` · `/v1/completions` · `/generate` — non-stream JSON
   or SSE (`data: {chunk}\n\n … data: [DONE]\n\n`)
 - `GET /v1/loads?include=core` → `WorkerLoadResponse` (load-aware policies)
+- `POST /flush_cache` · `/start_profile` · `/stop_profile` — the gateway's admin
+  fan-out: the flush clears the engine's cache (a canned worker has none) and
+  answers 200; a profiling run starts with the body's options and ends with one
+  trace file in its output directory (a run already in progress, or a stop with
+  none, is a 409)
 
 **gRPC** (TokenSpeed scheduler — the gateway tokenizes, the worker speaks token
 ids): `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed
-chunks + complete), `GetLoads`, `Abort`, and (realistic mode only)
-`SubscribeKvEvents`; other admin RPCs return `unimplemented`. Beside the
+chunks + complete), `GetLoads`, `Abort`, (realistic mode only)
+`SubscribeKvEvents`, and the admin fan-out's `FlushCache` (every rank's cache
+cleared at once, `success: true`), `StartProfile` and `StopProfile` (a run in
+progress refused with `success: false`, the trace file written at the stop);
+`GetTokenizer` returns `unimplemented`. Beside the
 scheduler service the server hosts the standard `grpc.health.v1` service
 (`Check`, `Watch`): the empty name and the scheduler service are SERVING
 exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
@@ -214,6 +222,9 @@ engines do not expose:
   worker, the requests the `fail` hook answered before admission (they left no
   record) and the streams it cut;
 - `GET /admin/cache/{worker}` — the worker's cached block keys;
+- `GET /admin/ops/{worker}` — what the gateway's admin fan-out reached on the
+  worker: `flushes`, `profiles_started`, `profiles_stopped`, whether a run is
+  `profiling`, the `last_trace` written (`all`: every worker);
 - `POST /admin/reset[/{worker}]` — clear caches and publish `AllBlocksCleared`
   (an engine restart, to the index).
 
