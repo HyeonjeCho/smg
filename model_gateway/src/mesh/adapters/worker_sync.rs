@@ -2205,6 +2205,111 @@ mod tests {
         );
     }
 
+    /// A worker of `url` serving `model`, as the start-up jobs register it.
+    fn local_worker_of(url: &str, model: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model))
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_claim_after_a_restart_publishes_above_the_earlier_lifes_version() {
+        // The published version is the owner's worker revision, which
+        // restarts at zero with the process; the key outlives it. A life
+        // that replaced its worker once published version 1 or more, and a
+        // peer recorded that version with its import. The new life claims
+        // the key its earlier life left (the start-up upsert over the
+        // import), which bumps a fresh revision to 1: without the raise,
+        // the claim publishes at or below what the peer holds, and the
+        // peer keeps the earlier life's specification for good.
+        let mesh = MeshKV::new("node-p".into());
+        let ns = worker_namespace(&mesh);
+        let url = "http://engine:8080";
+        let first_registry = Arc::new(WorkerRegistry::new());
+        let first_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            first_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        let first_id = first_registry
+            .register(local_worker_of(url, "model-a"))
+            .unwrap();
+        // A replacement in the first life (a `PUT`, a discovery refresh):
+        // the key's version is 1 or more from here on.
+        assert_eq!(
+            first_registry.register_or_replace(local_worker_of(url, "model-a")),
+            first_id
+        );
+        first_life.resync_local(&mut HashMap::new());
+        let first_key = format!("worker:{}", first_id.as_str());
+        let first_version = version_of(&ns, &first_key).expect("the first life's key");
+        assert!(
+            first_version >= 1,
+            "the first life published at {first_version}"
+        );
+        drop(first_life);
+        drop(first_registry);
+
+        let peer_registry = Arc::new(WorkerRegistry::new());
+        let peer = WorkerSyncAdapter::new(
+            ns.clone(),
+            peer_registry.clone(),
+            "node-s".into(),
+            empty_cluster(),
+        );
+        peer.start();
+        assert!(
+            wait_for(|| peer_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the peer imported the worker under the owner's first id"
+        );
+        assert_eq!(
+            peer_registry
+                .get_by_url(url)
+                .map(|worker| worker.model_id().to_string()),
+            Some("model-a".to_string())
+        );
+
+        // The owner comes back under its name, imports its earlier life's
+        // key, and the start-up upsert claims it with the new configuration.
+        let second_registry = Arc::new(WorkerRegistry::new());
+        let second_life = WorkerSyncAdapter::new(
+            ns.clone(),
+            second_registry.clone(),
+            "node-p".into(),
+            empty_cluster(),
+        );
+        second_life.start();
+        assert!(
+            wait_for(|| second_registry.get_id_by_url(url).as_ref() == Some(&first_id)).await,
+            "the new life imports the key of its earlier life"
+        );
+        assert_eq!(
+            second_registry.register_or_replace(local_worker_of(url, "model-b")),
+            first_id,
+            "the claim keeps the id"
+        );
+        assert!(
+            wait_for(|| version_of(&ns, &first_key).is_some_and(|v| v > first_version)).await,
+            "the claim publishes above the earlier life's version {first_version}: {:?}",
+            version_of(&ns, &first_key)
+        );
+        assert!(
+            wait_for(|| {
+                peer_registry
+                    .get_by_url(url)
+                    .is_some_and(|worker| worker.model_id() == "model-b")
+            })
+            .await,
+            "the peer's import follows the claim's specification: {:?}",
+            peer_registry
+                .get_by_url(url)
+                .map(|worker| worker.model_id().to_string())
+        );
+    }
+
     /// A locally registered worker as discovery registers it: the provider's
     /// instance id in its labels.
     fn discovered_worker(url: &str, instance: &str) -> Arc<dyn Worker> {
