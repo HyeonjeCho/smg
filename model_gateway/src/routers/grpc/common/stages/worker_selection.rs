@@ -31,9 +31,9 @@ use crate::{
         error,
         grpc::{
             context::{
-                stage_output, DispatchContext, EncodeWorkerAssignment, PreparationOutput,
-                RequestContext, RequestInput, RequestType, RoutingSnapshot, WireConstraint,
-                WorkerSelection,
+                stage_output, DispatchContext, EncodeWorkerAssignment, ExecutionPlan,
+                PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
+                WireConstraint, WorkerSelection,
             },
             multimodal,
         },
@@ -304,7 +304,8 @@ impl PipelineStage for WorkerSelectionStage {
 /// the media it carries and what that demands of a worker, the context
 /// requirements, the routing text and token ids, the keys, the wire the
 /// request type pins, and the model. Gathered once ([`Self::gather`]), kept
-/// for the retries in the routing snapshot ([`Self::snapshot`]), read by the
+/// for the retries in the routing snapshot ([`Self::snapshot`]; the token
+/// ids excepted: a retry reads them off the retained plan), read by the
 /// pick ([`WorkerSelectionStage::pick`]).
 struct SelectionInputs<'a> {
     intermediate: Option<&'a multimodal::MultimodalIntermediate>,
@@ -433,7 +434,8 @@ impl<'a> SelectionInputs<'a> {
         }
     }
 
-    /// The selection inputs that survive the request drop: retry attempts
+    /// The selection inputs that survive the request drop, the token ids
+    /// excepted (a retry reads them off the retained plan): retry attempts
     /// re-select from these.
     fn snapshot(&self) -> RoutingSnapshot {
         RoutingSnapshot {
@@ -442,7 +444,6 @@ impl<'a> SelectionInputs<'a> {
                 .keep_text
                 .then(|| self.text.map(str::to_string))
                 .flatten(),
-            token_ids: self.ids.to_vec(),
             rid_key: self.rid_key.clone(),
             cache_namespace: self.cache_namespace,
             needs_vision: self.needs_vision,
@@ -653,15 +654,20 @@ impl WorkerSelectionStage {
         format!("WorkerSelectionStage({:?})", self.mode)
     }
 
-    /// Per-attempt re-selection from the routing snapshot, after the request
-    /// dropped at build. Candidates are pinned to the retained plan's wire
-    /// (runtime + transport): the plan cannot be rebuilt for another flavor.
+    /// Per-attempt re-selection from the routing snapshot and the retained
+    /// plan's prompt ids, after the request dropped at build. Candidates are
+    /// pinned to the retained plan's wire (runtime + transport): the plan
+    /// cannot be rebuilt for another flavor.
     /// EPD re-selects only the prefill/decode pair — the first dispatch
     /// already launched the encode jobs, and the plan carries their
     /// bootstrap rooms. A disaggregated retry takes a fresh Prefill
     /// admission slot for its new prefill worker.
-    pub(crate) async fn reselect(&self, ctx: &mut DispatchContext) -> Result<(), Response> {
-        self.reselect_workers(ctx).await.map_err(|refusal| {
+    pub(crate) async fn reselect(
+        &self,
+        ctx: &mut DispatchContext,
+        plan: &ExecutionPlan,
+    ) -> Result<(), Response> {
+        self.reselect_workers(ctx, plan).await.map_err(|refusal| {
             self.report_refusal(
                 "WorkerSelectionStage::reselect",
                 ctx.request_id.as_deref(),
@@ -672,13 +678,13 @@ impl WorkerSelectionStage {
     }
 
     /// The re-selection behind [`Self::reselect`].
-    async fn reselect_workers(&self, ctx: &mut DispatchContext) -> Result<(), Response> {
+    async fn reselect_workers(
+        &self,
+        ctx: &mut DispatchContext,
+        plan: &ExecutionPlan,
+    ) -> Result<(), Response> {
         let text = ctx.routing.routing_text.as_deref();
-        let tokens = if ctx.routing.token_ids.is_empty() {
-            None
-        } else {
-            Some(ctx.routing.token_ids.as_slice())
-        };
+        let tokens = Some(plan.routing_token_ids()).filter(|ids| !ids.is_empty());
         let rid_key = ctx.routing.rid_key.as_deref();
         let cache_namespace = ctx.routing.cache_namespace;
         let headers = ctx.headers.as_ref();
@@ -2169,6 +2175,7 @@ mod tests {
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use llm_tokenizer::TokenizerRegistry;
     use openai_protocol::{generate::GenerateRequest, worker::HealthCheckConfig};
+    use smg_grpc_client::vllm_proto as vllm;
 
     use super::*;
     use crate::{
@@ -2184,6 +2191,7 @@ mod tests {
             },
             grpc::{
                 context::{PreparationOutput, SharedComponents},
+                proto_wrapper::{ProtoGenerateRequest, ProtoRequest},
                 regular::symphony::template::Templates,
                 utils,
             },
@@ -3097,6 +3105,22 @@ mod tests {
         );
     }
 
+    /// The retained plan of a retry: one tokenized request carrying `ids`.
+    fn retained_plan(ids: &[u32]) -> ExecutionPlan {
+        ExecutionPlan::Single(ProtoRequest::Generate(ProtoGenerateRequest::Vllm(
+            Box::new(vllm::GenerateRequest {
+                request_id: "retained".to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: ids.to_vec(),
+                    },
+                )),
+                ..Default::default()
+            }),
+        )))
+    }
+
     /// A retry context with a retained wire and no extra request constraints.
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
@@ -3115,7 +3139,6 @@ mod tests {
             routing: RoutingSnapshot {
                 context_requirements: ContextRequirements::default(),
                 routing_text: None,
-                token_ids: vec![1, 2, 3],
                 rid_key: None,
                 cache_namespace: None,
                 needs_vision: false,
@@ -3189,7 +3212,10 @@ mod tests {
             },
         );
         for _ in 0..8 {
-            stage.reselect(&mut ctx).await.unwrap();
+            stage
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                .await
+                .unwrap();
             match ctx.workers.as_ref().unwrap() {
                 WorkerSelection::Single { worker } => {
                     assert_eq!(
@@ -3264,20 +3290,29 @@ mod tests {
         ctx.constraint_decided_on = Some(decided_on(&workers[0]));
         ctx.tried.push(workers[0].base_url().to_string());
         for _ in 0..8 {
-            stage.reselect(&mut ctx).await.unwrap();
+            stage
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                .await
+                .unwrap();
             assert_eq!(selected(&ctx), "grpc://127.0.0.1:9333");
         }
         // Decided on the `always` worker that starts the grammar later.
         ctx.constraint_decided_on = Some(decided_on(&workers[2]));
         for _ in 0..8 {
-            stage.reselect(&mut ctx).await.unwrap();
+            stage
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                .await
+                .unwrap();
             assert_eq!(selected(&ctx), "grpc://127.0.0.1:9332");
         }
         // Without a decision (no constraint was decided for the request), any worker.
         ctx.constraint_decided_on = None;
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..8 {
-            stage.reselect(&mut ctx).await.unwrap();
+            stage
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                .await
+                .unwrap();
             seen.insert(selected(&ctx));
         }
         assert_eq!(seen.len(), 3, "{seen:?}");
@@ -3363,7 +3398,10 @@ mod tests {
                 &request,
             );
             for _ in 0..8 {
-                stage.reselect(&mut ctx).await.unwrap();
+                stage
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                    .await
+                    .unwrap();
                 let selected = match ctx.workers.as_ref().unwrap() {
                     WorkerSelection::Single { worker } => worker,
                     WorkerSelection::Disaggregated { decode, .. } => decode,
@@ -3372,7 +3410,7 @@ mod tests {
             }
             workers[2].set_status(openai_protocol::worker::WorkerStatus::NotReady);
             let refusal = stage
-                .reselect(&mut ctx)
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
                 .await
                 .expect_err("eligible grammar worker is unavailable");
             assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -3442,7 +3480,10 @@ mod tests {
             ));
             ctx.routing.context_requirements = ContextRequirements::new(&prep, &request);
             for _ in 0..8 {
-                stage.reselect(&mut ctx).await.unwrap();
+                stage
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                    .await
+                    .unwrap();
                 match ctx.workers.as_ref().unwrap() {
                     WorkerSelection::Single { worker } => {
                         assert_eq!(worker.context_length(model_id), Some(64));
@@ -3466,7 +3507,7 @@ mod tests {
                 pool.iter(),
             );
             let refusal = stage
-                .reselect(&mut ctx)
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
                 .await
                 .expect_err("no fitting untried worker");
             assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -3520,9 +3561,15 @@ mod tests {
             WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
         };
 
-        stage.reselect(&mut ctx).await.unwrap();
+        stage
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+            .await
+            .unwrap();
         let owner = selected(&ctx);
-        stage.reselect(&mut ctx).await.unwrap();
+        stage
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+            .await
+            .unwrap();
         assert_eq!(
             selected(&ctx).url(),
             owner.url(),
@@ -3530,7 +3577,10 @@ mod tests {
         );
 
         ctx.tried.push(owner.base_url().to_string());
-        stage.reselect(&mut ctx).await.unwrap();
+        stage
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+            .await
+            .unwrap();
         let second = selected(&ctx);
         assert_ne!(
             second.url(),
@@ -3539,7 +3589,10 @@ mod tests {
         );
 
         ctx.tried.push(second.base_url().to_string());
-        stage.reselect(&mut ctx).await.unwrap();
+        stage
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+            .await
+            .unwrap();
         let third = selected(&ctx);
         assert!(
             third.url() != owner.url() && third.url() != second.url(),
@@ -3547,7 +3600,10 @@ mod tests {
         );
 
         ctx.tried.push(third.base_url().to_string());
-        stage.reselect(&mut ctx).await.unwrap();
+        stage
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+            .await
+            .unwrap();
         assert_eq!(
             selected(&ctx).url(),
             owner.url(),
@@ -3610,7 +3666,10 @@ mod tests {
             },
         );
         for _ in 0..8 {
-            stage.reselect(&mut ctx).await.unwrap();
+            stage
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                .await
+                .unwrap();
             match ctx.workers.as_ref().unwrap() {
                 WorkerSelection::Disaggregated {
                     prefill,
@@ -3675,7 +3734,7 @@ mod tests {
         );
 
         let response = stage
-            .reselect(&mut ctx)
+            .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
             .await
             .expect_err("the pinned pool is fully vetoed");
         assert_eq!(
@@ -3738,27 +3797,28 @@ mod tests {
         };
         let prompt: Vec<u32> = (1..33).collect();
 
-        // Worker 1 is busier, so tenant A's first selection lands on worker 2.
+        // The prompt's ids route from the retained plan, not from a copy of
+        // their own. Worker 1 is busier, so tenant A's first selection lands
+        // on worker 2.
+        let plan = retained_plan(&prompt);
         workers[0].increment_load();
         let mut ctx = dispatch_ctx(model_id, wire);
-        ctx.routing.token_ids = prompt.clone();
         ctx.routing.cache_namespace = namespace("tenant-a");
-        stage.reselect(&mut ctx).await.unwrap();
+        stage.reselect(&mut ctx, &plan).await.unwrap();
         assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
 
         // A retry from the retained snapshot stays in tenant A's partition
         // even once worker 2 is the busier one...
         workers[1].increment_load();
         workers[1].increment_load();
-        stage.reselect(&mut ctx).await.unwrap();
+        stage.reselect(&mut ctx, &plan).await.unwrap();
         assert_eq!(selected(&ctx), "grpc://127.0.0.1:9402");
 
         // ...while a retained snapshot for tenant B misses and takes the
         // least-loaded worker 1.
         let mut other = dispatch_ctx(model_id, wire);
-        other.routing.token_ids = prompt;
         other.routing.cache_namespace = namespace("tenant-b");
-        stage.reselect(&mut other).await.unwrap();
+        stage.reselect(&mut other, &plan).await.unwrap();
         assert_eq!(selected(&other), "grpc://127.0.0.1:9401");
     }
 
@@ -4068,7 +4128,10 @@ mod tests {
                 },
             );
             for _ in 0..6 {
-                stage.reselect(&mut ctx).await.unwrap();
+                stage
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                    .await
+                    .unwrap();
                 match ctx.workers.as_ref().unwrap() {
                     WorkerSelection::Single { worker } => {
                         assert_eq!(worker.url(), expected, "{pin:?}");
@@ -4309,7 +4372,7 @@ mod tests {
                 let mut ctx = dispatch_ctx(model_id, wire);
                 ctx.routing.needs_vision = needs_vision;
                 stage
-                    .reselect(&mut ctx)
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
                     .await
                     .expect("re-selection succeeds");
                 match ctx.workers.expect("a worker is selected") {
@@ -5212,7 +5275,7 @@ mod tests {
                 let mut ctx = dispatch_ctx(model_id, wire);
                 ctx.routing.needs_vision = needs_vision;
                 stage
-                    .reselect(&mut ctx)
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
                     .await
                     .expect("re-selection succeeds");
                 match ctx.workers.expect("a pair is selected") {
@@ -5482,10 +5545,9 @@ mod tests {
             .await
             .expect("a tokenized request selects");
         let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
-        assert_eq!(snapshot.token_ids, [1, 2, 3]);
         assert!(
             snapshot.routing_text.is_none(),
-            "the ids route; the prompt is not copied: {:?}",
+            "the ids route (from the retained plan on a retry); the prompt is not copied: {:?}",
             snapshot.routing_text
         );
 
@@ -5499,7 +5561,6 @@ mod tests {
             .await
             .expect("a text request selects");
         let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
-        assert!(snapshot.token_ids.is_empty());
         assert_eq!(snapshot.routing_text.as_deref(), Some("Hello"));
     }
 
@@ -5866,7 +5927,7 @@ mod tests {
                 let mut ctx = dispatch_ctx(model_id, wire);
                 ctx.routing.decode_needs_vision = decode_needs_vision;
                 stage
-                    .reselect(&mut ctx)
+                    .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
                     .await
                     .expect("re-selection succeeds");
                 match ctx.workers.expect("a pair is selected") {
