@@ -1,20 +1,31 @@
 //! The request's entry stamp: the one clock read the edge takes when a
 //! request comes in, which the layers inside share instead of reading the
 //! clock again. The metrics layer, the outermost layer with a clock, takes
-//! it and puts it on the request's extensions; the access log counts its
+//! it and runs the request inside its scope; the access log counts its
 //! latency from it and the in-flight guard ages the request from it. Each
-//! keeps a read of its own for a request that reaches it without the stamp
+//! keeps a read of its own for a request that reaches it outside the scope
 //! (a bare stack in a test). The stamps inside the admission layers (the
 //! acceptance at tenant resolution, the request-body deadline) stay reads of
 //! their own: a wait for a permit sits between the edge and them.
+//!
+//! The stamp is a task-local of the request's future
+//! ([`RequestStarted::scope`]), not an entry on the request's extensions:
+//! an entry is a box per request and, at the edge's entry count, the map's
+//! growth too (the eighth entry rehashes the table into one twice the size),
+//! for one `Instant` the layers inside read once.
 //!
 //! The stamp is on the runtime's clock ([`clock_now`]): the wall clock in
 //! production, the paused clock of a test that advances time itself, which
 //! is also the clock the acceptance stamp is read on.
 
-use std::time::Instant;
+use std::{future::Future, time::Instant};
 
-use http::Extensions;
+use tokio::task::futures::TaskLocalFuture;
+
+tokio::task_local! {
+    /// The entry stamp of the request whose future runs.
+    static STARTED: RequestStarted;
+}
 
 /// When the request came in at the edge.
 #[derive(Clone, Copy, Debug)]
@@ -36,9 +47,17 @@ impl RequestStarted {
         self.0
     }
 
-    /// The stamp a request carries, when the edge put one on it.
-    pub fn of(extensions: &Extensions) -> Option<Instant> {
-        extensions.get::<Self>().map(|started| started.0)
+    /// Runs `future` as the request's: inside it, [`RequestStarted::current`]
+    /// reads this stamp. The edge's future runs the layers inside from their
+    /// `call`s on, so they read it there as well as from their futures.
+    pub fn scope<F: Future>(self, future: F) -> TaskLocalFuture<RequestStarted, F> {
+        STARTED.scope(self, future)
+    }
+
+    /// The entry stamp of the request whose future runs, when the edge put
+    /// one on it.
+    pub fn current() -> Option<Instant> {
+        STARTED.try_with(|started| started.0).ok()
     }
 }
 
@@ -55,16 +74,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_request_without_the_stamp_reads_as_none() {
-        assert!(RequestStarted::of(&Extensions::new()).is_none());
+    fn outside_a_request_s_scope_there_is_no_stamp() {
+        assert!(RequestStarted::current().is_none());
     }
 
-    #[test]
-    fn the_stamp_a_request_carries_is_the_instant_it_was_taken_at() {
+    #[tokio::test]
+    async fn inside_the_scope_the_stamp_is_the_instant_it_was_taken_at() {
         let at = Instant::now() - Duration::from_secs(3);
-        let mut extensions = Extensions::new();
-        extensions.insert(RequestStarted::at(at));
-        assert_eq!(RequestStarted::of(&extensions), Some(at));
+        let read = RequestStarted::at(at)
+            .scope(async { RequestStarted::current() })
+            .await;
+        assert_eq!(read, Some(at));
+        assert!(
+            RequestStarted::current().is_none(),
+            "the scope ends with the request's future"
+        );
     }
 
     #[tokio::test(start_paused = true)]

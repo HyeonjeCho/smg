@@ -185,21 +185,20 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, mut req: Request) -> Self::Future {
+    fn call(&mut self, req: Request) -> Self::Future {
         let method = method_to_static_str(req.method().as_str());
         let path = PathLabel::of(req.extensions());
-        // The request's entry stamp: read from the clock once, here, and
-        // carried on the request for the layers inside (the access log's
-        // latency, the in-flight age, the acceptance, the body deadline all
-        // count from it; see `request_start`).
+        // The request's entry stamp: read from the clock once, here, and the
+        // request run inside its scope for the layers inside (the access
+        // log's latency and the in-flight age count from it; see
+        // `request_start`).
         let started = RequestStarted::now();
-        req.extensions_mut().insert(started);
         let start = started.instant();
 
         let mut inner = self.inner.clone();
         let in_flight_request_tracker = self.in_flight_request_tracker.clone();
 
-        Box::pin(async move {
+        Box::pin(started.scope(async move {
             let guard = in_flight_request_tracker.track_from(start);
             Metrics::set_http_connections_active(in_flight_request_tracker.len());
             // Counted once the outcome is known. Dropped with this future
@@ -250,7 +249,7 @@ where
                 duties,
             ));
             Ok(Response::from_parts(parts, body))
-        })
+        }))
     }
 }
 
@@ -1194,17 +1193,17 @@ mod client_closed_tests {
     }
 
     /// The layer reads the clock once at the request's entry and shares the
-    /// stamp: the handler finds it on the request, and the request's
-    /// duration runs from it to the head, on the runtime's clock.
+    /// stamp: the handler finds it in the request's scope, and the
+    /// request's duration runs from it to the head, on the runtime's clock.
     #[test]
-    fn the_entry_stamp_rides_the_request_and_the_duration_runs_from_it() {
+    fn the_entry_stamp_scopes_the_request_and_the_duration_runs_from_it() {
         let rendered = render_paused(|_| async {
             let app = Router::new()
                 .route(
                     "/stamped",
-                    get(|request: Request<Body>| async move {
-                        let started = RequestStarted::of(request.extensions())
-                            .expect("the entry stamp rides the request");
+                    get(|| async move {
+                        let started =
+                            RequestStarted::current().expect("the entry stamp scopes the request");
                         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         assert_eq!(
                             clock_now().saturating_duration_since(started),
